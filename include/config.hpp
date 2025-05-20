@@ -1,4 +1,6 @@
 #pragma once
+#include <stdint.h>
+#include <stddef.h>
 
 // ADC 采样率 (最大 7)
 #define SAMPLE_RATE 4
