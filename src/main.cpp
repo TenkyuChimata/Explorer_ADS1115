@@ -7,8 +7,18 @@
 ADS1115 adc(0x48);
 int32_t channelZ[PACKET_SIZE], channelE[PACKET_SIZE], channelN[PACKET_SIZE];
 
+uint32_t lastMs = 0;
+uint64_t overflowCount = 0;
+
 uint64_t getTimestamp() {
-    return (uint64_t)millis();
+    uint32_t current = millis();
+    if (current < lastMs) {
+        // 检测到回绕，累加一次 2^32
+        overflowCount++;
+    }
+    lastMs = current;
+    // 用高 32 位存 overflowCount，低 32 位存当前 millis()
+    return (overflowCount << 32) | current;
 }
 
 // 根据 timeStamp % 4 决定 variable_data 字段
@@ -16,7 +26,7 @@ uint32_t getVariableData(uint64_t ts) {
     uint8_t which = ts & 0x3;
     switch (which) {
     case 0:
-        // DEVICE_ID，最高位 GNSS_EN 这里假设 0
+        // DEVICE_ID，最高位 GNSS_EN
         return (0U << 31) | DEVICE_ID;
     default:
         return 0;
@@ -44,11 +54,11 @@ void loop() {
     }
 
     // —— 2. 按 v2 协议组包 ——
-    uint8_t packet[PROTOCOL_V2_PACKET_LENGTH];
+    uint8_t packet[PACKET_LENGTH];
 
     // 2.1 包头 (0–1)
-    packet[0] = PROTOCOL_V2_HEADER[0];
-    packet[1] = PROTOCOL_V2_HEADER[1];
+    packet[0] = HEADER[0];
+    packet[1] = HEADER[1];
 
     // 2.2 时间戳 (2–9, 8 字节, 大端)
     uint64_t ts = getTimestamp();
@@ -86,10 +96,10 @@ void loop() {
     }
 
     // 2.5 校验和 (74)
-    packet[74] = getChecksum(packet, PROTOCOL_V2_PACKET_LENGTH);
+    packet[74] = getChecksum(packet, PACKET_LENGTH);
 
     // —— 3. 发送 ——
-    Serial.write(packet, PROTOCOL_V2_PACKET_LENGTH);
+    Serial.write(packet, PACKET_LENGTH);
     Serial.flush();
 
     // 按协议建议的发送间隔
