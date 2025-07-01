@@ -7,18 +7,17 @@
 ADS1115 adc(0x48);
 int32_t channelZ[PACKET_SIZE], channelE[PACKET_SIZE], channelN[PACKET_SIZE];
 
-uint32_t lastMs = 0;
-uint64_t overflowCount = 0;
+uint64_t mcu_utils_uptime_ms(void) {
+    static uint32_t low32 = 0;
+    static uint32_t high32 = 0;
 
-uint64_t getTimestamp() {
-    uint32_t current = millis();
-    if (current < lastMs) {
-        // 检测到回绕，累加一次 2^32
-        overflowCount++;
+    uint32_t new_low32 = millis();
+    if (new_low32 < low32) {
+        high32++;
     }
-    lastMs = current;
-    // 用高 32 位存 overflowCount，低 32 位存当前 millis()
-    return (overflowCount << 32) | current;
+    low32 = new_low32;
+
+    return (uint64_t)high32 << 32 | low32;
 }
 
 // 根据 timeStamp % 4 决定 variable_data 字段
@@ -33,19 +32,19 @@ uint32_t getVariableData(uint64_t ts) {
     }
 }
 
-void initADC() {
+void initADC(void) {
     Wire.begin();
     adc.begin();
     adc.setGain(GAIN_RATE);
     adc.setDataRate(SAMPLE_RATE);
 }
 
-void setup() {
+void setup(void) {
     Serial.begin(SERIAL_BAUD);
     initADC();
 }
 
-void loop() {
+void loop(void) {
     // —— 1. 读 5 个点 ——
     for (int i = 0; i < PACKET_SIZE; i++) {
         channelZ[i] = (int32_t)adc.readADC(0);
@@ -61,7 +60,7 @@ void loop() {
     packet[1] = HEADER[1];
 
     // 2.2 时间戳 (2–9, 8 字节, 大端)
-    uint64_t ts = getTimestamp();
+    uint64_t ts = mcu_utils_uptime_ms();
     for (uint8_t i = 0; i < 8; i++) {
         packet[2 + i] = (uint8_t)(ts >> (56 - 8 * i));
     }

@@ -5,7 +5,7 @@
 // ADC 采样率 (最大 7)
 #define SAMPLE_RATE 4
 // ADC 放大倍数 (最大 16)
-#define GAIN_RATE 1
+#define GAIN_RATE 0
 // 串口波特率 (最大 921600)
 #define SERIAL_BAUD 57600
 // 每个包每通道的样本数
