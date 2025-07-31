@@ -1,131 +1,97 @@
 #include <Arduino.h>
-#include <Wire.h>
+#include <stdbool.h>
 #include <stdint.h>
-#include "config.hpp"
+#include <string.h>
+#include <Wire.h>
+
+#include "utils/delay.h"
+#include "utils/gpio.h"
+#include "utils/led.h"
+#include "utils/uart.h"
+#include "utils/uptime.h"
+
+#include "array.h"
+#include "packet.h"
+#include "settings.h"
 #include "ads1115/ADS1X15.h"
 
+#ifndef FW_BUILD
+#define FW_BUILD "unknownbuild"
+#endif
+
+#ifndef FW_REV
+#define FW_REV "custombuild"
+#endif
+
+typedef struct {
+    uint8_t sample_time_span;
+    uint8_t channel_samples;
+
+    int64_t timestamp;
+    uint8_t sample_pos = 0;
+
+    int32_t adc_readout_z_axis[MAINLINE_PACKET_CHANNEL_SAMPLES];
+    int32_t adc_readout_e_axis[MAINLINE_PACKET_CHANNEL_SAMPLES];
+    int32_t adc_readout_n_axis[MAINLINE_PACKET_CHANNEL_SAMPLES];
+
+    uint8_array_t* uart_packet_buffer;
+} explorer_states_t;
+
 ADS1115 adc(0x48);
-int32_t channelZ[PACKET_SIZE], channelE[PACKET_SIZE], channelN[PACKET_SIZE];
-
-// 设备运行 uptime 毫秒（使用 millis() 组合处理 rollover）
-uint64_t mcu_utils_uptime_ms(void) {
-    static uint32_t low32 = 0;
-    static uint32_t high32 = 0;
-
-    uint32_t new_low32 = millis();
-    if (new_low32 < low32) {
-        high32++;
-    }
-    low32 = new_low32;
-
-    return ((uint64_t)high32 << 32) | low32;
-}
-
-// 根据 timeStamp % 4 决定 variable_data 字段
-uint32_t getVariableData(uint64_t ts) {
-    uint8_t which = ts & 0x3;
-    switch (which) {
-    case 0:
-        // DEVICE_ID，最高位 GNSS_EN
-        return (0U << 31) | DEVICE_ID;
-    default:
-        return 0;
-    }
-}
-
-// 小端写入辅助
-static inline void write_le64(uint8_t *dst, uint64_t v) {
-    memcpy(dst, &v, sizeof(v));
-}
-
-static inline void write_le32(uint8_t *dst, uint32_t v) {
-    memcpy(dst, &v, sizeof(v));
-}
-
-static inline void write_le32_array(uint8_t *dst, const int32_t *src, size_t count) {
-    for (size_t i = 0; i < count; i++) {
-        memcpy(dst + i * 4, &src[i], 4);
-    }
-}
-
-// XOR checksum: 从 index 2 到倒数第二个字节（排除 header 和 checksum 本身）
-uint8_t calc_xor(const uint8_t *buf, size_t len) {
-    uint8_t x = 0;
-    if (len < 3)
-        return 0;
-    for (size_t i = 2; i < len - 1; i++) {
-        x ^= buf[i];
-    }
-    return x;
-}
-
-void initADC(void) {
-    Wire.begin();
-    adc.begin();
-    adc.setGain(GAIN_RATE);
-    adc.setDataRate(SAMPLE_RATE);
-}
+static explorer_states_t explorer_states;
 
 void setup(void) {
-    Serial.begin(SERIAL_BAUD);
-    initADC();
+    explorer_states.sample_time_span = 1000 / EXPLORER_SAMPLERATE;
+    explorer_states.sample_pos = 0;
+    explorer_states.timestamp = 0;
+
+    uint8_t packet_size = get_data_packet_size(MAINLINE_PACKET_CHANNEL_SAMPLES);
+    explorer_states.uart_packet_buffer = array_uint8_make(packet_size);
+
+    mcu_utils_gpio_init(false);
+    mcu_utils_gpio_mode(MCU_STATE_PIN, MCU_UTILS_GPIO_MODE_OUTPUT);
+    mcu_utils_led_blink(MCU_STATE_PIN, 3, false);
+    mcu_utils_delay_ms(1000, false);
+
+    mcu_utils_uart_init(EXPLORER_BAUDRATE, false);
+    mcu_utils_uart_flush();
+
+    char fw_info_buf[43];
+    snprintf(fw_info_buf, sizeof(fw_info_buf), "FW REV: %s\r\nBUILD: %s\r\n", FW_REV, FW_BUILD);
+    mcu_utils_uart_write((uint8_t*)fw_info_buf, sizeof(fw_info_buf), true);
+
+    mcu_utils_led_blink(MCU_STATE_PIN, 3, false);
+
+    mcu_utils_delay_ms(1000, false);
+    mcu_utils_gpio_high(MCU_STATE_PIN);
+
+    Wire.begin();
+    Wire.setClock(400000);
+    adc.begin();
+    adc.setGain(GAIN_RATE);
+    adc.setDataRate(ADC_SAMPLE_RATE);
 }
 
 void loop(void) {
-    // —— 1. 采样 PACKET_SIZE 个点 ——
-    for (int i = 0; i < PACKET_SIZE; i++) {
-        channelZ[i] = (int32_t)adc.readADC(0);
-        channelE[i] = (int32_t)adc.readADC(1);
-        channelN[i] = (int32_t)adc.readADC(2);
+    static uint64_t next_sample_time = 0;
+    uint64_t now = mcu_utils_uptime_ms();
+
+    if (now < next_sample_time) {
+        return;
+    }
+    next_sample_time = now + explorer_states.sample_time_span;
+
+    if (explorer_states.sample_pos == 0) {
+        explorer_states.timestamp = now;
     }
 
-    // —— 2. 构造数据包 ——
-    uint8_t packet[PACKET_LENGTH];
+    explorer_states.adc_readout_z_axis[explorer_states.sample_pos] = (int32_t)adc.readADC(0);
+    explorer_states.adc_readout_e_axis[explorer_states.sample_pos] = (int32_t)adc.readADC(1);
+    explorer_states.adc_readout_n_axis[explorer_states.sample_pos] = (int32_t)adc.readADC(2);
+    explorer_states.sample_pos++;
 
-    // 2.1 包头
-    packet[0] = HEADER[0];
-    packet[1] = HEADER[1];
-
-    // 2.2 时间戳（小端）
-    uint64_t ts = mcu_utils_uptime_ms();
-    write_le64(&packet[2], ts);
-
-    // 2.3 可变字段（小端）
-    uint32_t var = getVariableData(ts);
-    write_le32(&packet[10], var);
-
-    // 2.4 三通道数据（小端）
-    const size_t header_len = 2 + 8 + 4; // 14
-    const size_t channel_block = PACKET_SIZE * 4;
-
-    write_le32_array(&packet[header_len + 0 * channel_block], channelZ, PACKET_SIZE); // Z
-    write_le32_array(&packet[header_len + 1 * channel_block], channelE, PACKET_SIZE); // E
-    write_le32_array(&packet[header_len + 2 * channel_block], channelN, PACKET_SIZE); // N
-
-    // 2.5 校验和（最后一个字节）
-    packet[PACKET_LENGTH - 1] = calc_xor(packet, PACKET_LENGTH);
-
-    // —— 3. 发送 ——
-    Serial.write(packet, PACKET_LENGTH);
-    Serial.flush();
-
-    // —— 4. 精确间隔：用 busy-wait（while 空转）而不是 delay ——
-    // 原意间隔为 5000ms / SAMPLE_RATE
-    const uint32_t interval_us = (uint32_t)((5000000ULL + SAMPLE_RATE / 2) / SAMPLE_RATE); // 四舍五入
-    static uint64_t next_wakeup = 0;
-    uint64_t now = micros();
-    if (next_wakeup == 0) {
-        next_wakeup = now + interval_us;
-    }
-    else {
-        next_wakeup += interval_us;
-        // 如果 drift 过大（漏掉太多周期），重置基准避免无限追赶
-        if ((int64_t)(now - next_wakeup) > (int64_t)interval_us * 5) {
-            next_wakeup = now + interval_us;
-        }
-    }
-    // busy-wait until target time
-    while ((int64_t)(micros() - next_wakeup) < 0) {
-        ;
+    if (explorer_states.sample_pos == MAINLINE_PACKET_CHANNEL_SAMPLES) {
+        send_data_packet(explorer_states.timestamp, explorer_states.adc_readout_z_axis, explorer_states.adc_readout_e_axis, explorer_states.adc_readout_n_axis, MAINLINE_PACKET_CHANNEL_SAMPLES, explorer_states.uart_packet_buffer);
+        explorer_states.sample_pos = 0;
     }
 }
