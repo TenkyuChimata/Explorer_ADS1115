@@ -7,7 +7,7 @@
 // ADC 放大倍数 (最大 16)
 #define GAIN_RATE 0
 // 串口波特率 (最大 921600)
-#define SERIAL_BAUD 57600
+#define SERIAL_BAUD 115200
 // 每个包每通道的样本数
 #define PACKET_SIZE 5
 
